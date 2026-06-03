@@ -5,6 +5,7 @@ from scipy.optimize import minimize
 from numpy.linalg import inv
 
 
+
 print("Reading the Excel file structure...")
 excel_file = pd.ExcelFile("BL AA project mischa data 18 May 2026 VALUES.xlsx")
 
@@ -31,17 +32,17 @@ for sheet_name in target_sheets:
     
     all_assets.append(asset_prices)
 
-# --- STEP 2: STITCH THEM TOGETHER ---
+# STITCH THEM TOGETHER
 prices = pd.concat(all_assets, axis=1)
 
-# --- STEP 3: ALIGN DATES ---
+# ALIGN DATES
 # Keep only data from Jan 2024 onward to match the Bitcoin ETF
 prices = prices.loc['2024-01-01':]
 
 # Drop rows with missing data
 prices = prices.dropna()
 
-# --- STEP 4: CALCULATE RETURNS & COVARIANCE ---
+# CALCULATE RETURNS & COVARIANCE
 returns = np.log(prices / prices.shift(1))
 returns = returns.dropna()
 
@@ -59,7 +60,7 @@ print("Data stitched successfully! Covariance matrix generated.")
 print("Loading Covariance Matrix from Phase 1...")
 cov_matrix = pd.read_csv("covariance_matrix.csv", index_col=0)
 
-# --- STEP 2.1: LIVE MARKET WEIGHTS ---
+# LIVE MARKET WEIGHTS
 tickers = [
     'SPY', 'HYG', 'EFA', 'EEM', 'TLT', 'GLD', 'SLV', 
     'DBC', 'VNQ', 'IBIT', 'IEV', 'XGLU', 'IEF', 'SHY'
@@ -70,13 +71,13 @@ market_caps = {}
 print("Pulling live market data from Yahoo Finance. This might take a minute...")
 for ticker in tickers:
     try:
-        # yfinance sometimes requires foreign stocks to have an extension. 
-        # XGLU is traded in London, so add '.L' for Yahoo Finance to find it.
+        # yfinance sometimes requires foreign stocks to have an extension
+        # XGLU is traded in London, so add '.L' for Yahoo Finance to find it
         search_ticker = 'XGLU.L' if ticker == 'XGLU' else ticker
         
         asset = yf.Ticker(search_ticker)
         
-        # For ETFs, the size is stored as 'totalAssets'. 
+        # For ETFs, the size is stored as 'totalAssets'
         # fallback to 'marketCap' if missing
         size = asset.info.get('totalAssets') or asset.info.get('marketCap')
         
@@ -101,11 +102,11 @@ market_weights = caps_series / caps_series.sum()
 market_weights = market_weights[cov_matrix.index]
 
 
-# --- STEP 2.2: RISK AVERSION COEFFICIENT (Lambda) ---
+# RISK AVERSION COEFFICIENT (Lambda)
 risk_aversion = 2.5
 
 
-# --- STEP 2.3: IMPLIED EQUILIBRIUM RETURNS (Pi) ---
+# IMPLIED EQUILIBRIUM RETURNS (Pi)
 # Pi = Lambda * Covariance * Weights
 implied_returns = risk_aversion * cov_matrix.dot(market_weights)
 
@@ -254,3 +255,123 @@ results['Difference'] = results['Black-Litterman (%)'] - results['Market Baselin
 
 print("\nFINAL EXPECTED RETURNS:")
 print(results)
+
+
+# PHASE 6
+
+print("\n--- STARTING PHASE 6: OPTIMIZE PORTFOLIO WEIGHTS ---")
+
+#Step 6.1- run mean-variance optimization 
+#Maximize: w' E[R] - (λ/2) w' Σ w
+# scipy minimizes so we return the negative of the utility 
+
+def objective_function(weights, expected_returns, cov_matrix, risk_aversion):
+    portfolio_return = weights.dot(expected_returns)
+    portfolio_var = weights.dot(cov_matrix).dot(weights)
+    
+    utility = portfolio_return - (risk_aversion / 2) * portfolio_var
+    return -utility
+
+# Constraint: All weights must sum exactly to 1.0 (fully invested)
+constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
+
+# Bounds: No short selling (every weight is between 0 and 1)
+bounds = tuple((0.0, 1.0) for _ in range(len(assets)))
+
+# Initial guess : the market weights
+initial_guess = market_weights.values
+
+# Run the optimizer
+optimal_result = minimize(
+    objective_function, 
+    initial_guess, 
+    args=(bl_returns, cov_matrix_annual.values, risk_aversion), 
+    method='SLSQP', 
+    bounds=bounds, 
+    constraints=constraints
+)
+
+# Extract the final winning weights
+optimal_weights = optimal_result.x
+
+# Step 6.2: Compare Portfolios
+final_portfolio = pd.DataFrame({
+    'Market Weight (%)': (market_weights * 100).round(2).values,
+    'BL Weight (%)': (optimal_weights * 100).round(2)
+}, index=assets)
+
+# Calculate the absolute difference
+final_portfolio['Difference'] = final_portfolio['BL Weight (%)'] - final_portfolio['Market Weight (%)']
+
+# Calculate the percentage change from the original weight
+# avoid dividing by zero in case a market weight was perfectly 0
+final_portfolio['% Change'] = ((final_portfolio['Difference'] / final_portfolio['Market Weight (%)'].replace(0, np.nan)) * 100).round(2)
+
+print("\nFINAL RECOMMENDED PORTFOLIO WEIGHTS:")
+print(final_portfolio)
+
+
+#Phase 7
+
+print("\n--- STARTING PHASE 7: VALIDATE & STRESS TEST ---")
+
+# 1. DEFINE THE RISK-FREE RATE as per the guide- using the current 10-year Treasury rate (~4.3%)
+risk_free_rate = 0.043
+
+# 2. CALCULATE PORTFOLIO RETURNS
+# Expected Return = Sum of (Weight * Expected Asset Return)
+mkt_return = market_weights.dot(Pi)
+bl_return = optimal_weights.dot(bl_returns)
+
+# 3. CALCULATE PORTFOLIO RISK (Standard Deviation)
+# Risk = Square Root of (Weights * Covariance * Weights)
+mkt_risk = np.sqrt(market_weights.dot(cov_matrix_annual.values).dot(market_weights))
+bl_risk = np.sqrt(optimal_weights.dot(cov_matrix_annual.values).dot(optimal_weights))
+
+# 4. CALCULATE SHARPE RATIOS
+# Sharpe = (Return - Risk Free Rate) / Risk
+mkt_sharpe = (mkt_return - risk_free_rate) / mkt_risk
+bl_sharpe = (bl_return - risk_free_rate) / bl_risk
+
+# 5. CALCULATE THE INFORMATION RATIO
+# Active Weights = How much your bets differ from the baseline
+active_weights = optimal_weights - market_weights.values
+
+# Active Return = How much extra return your bets generated
+active_return = bl_return - mkt_return
+
+# Active Risk = The volatility of those specific differences
+active_risk = np.sqrt(active_weights.dot(cov_matrix_annual.values).dot(active_weights))
+
+# Information Ratio = Active Return / Active Risk
+information_ratio = active_return / active_risk
+
+# 6. BUILD THE FINAL STATISTICS TABLE
+stats_table = pd.DataFrame({
+    'Market Default': [
+        f"{(mkt_return * 100):.2f}%", 
+        f"{(mkt_risk * 100):.2f}%", 
+        f"{mkt_sharpe:.3f}", 
+        "--"
+    ],
+    'Black-Litterman Target': [
+        f"{(bl_return * 100):.2f}%", 
+        f"{(bl_risk * 100):.2f}%", 
+        f"{bl_sharpe:.3f}", 
+        f"{information_ratio:.3f}"
+    ]
+}, index=['Expected Return', 'Risk (Std Dev)', 'Sharpe Ratio', 'Information Ratio'])
+
+print("\nFINAL PORTFOLIO STATISTICS:")
+print(stats_table)
+
+print("\n--- SANITY CHECK ---")
+if information_ratio > 2.0:
+    print(" WARNING: Your Information Ratio is extremely high (> 2.0).")
+    print("Your views are too aggressive. Try lowering your confidence levels in Phase 3.")
+elif information_ratio < 0.1:
+    print(" WARNING: Your Information Ratio is very low (< 0.1).")
+    print("Your views had almost no impact. Did you set your confidence too low?")
+else:
+    print("SUCCESS: Your Information Ratio looks healthy and realistic!")
+    print("Your model is ready to be presented.")
