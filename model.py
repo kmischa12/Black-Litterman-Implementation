@@ -35,9 +35,14 @@ for sheet_name in target_sheets:
 # STITCH THEM TOGETHER
 prices = pd.concat(all_assets, axis=1)
 
-# ALIGN DATES
+# ALIGN DATES, dropping IBIT and XGLU
 # Keep only data from Jan 2024 onward to match the Bitcoin ETF
-prices = prices.loc['2024-01-01':]
+if 'IBIT' in prices.columns:
+    prices = prices.drop(columns=['IBIT'])
+if 'XGLU' in prices.columns:
+    prices = prices.drop(columns=['XGLU'])
+
+
 
 # Drop rows with missing data
 prices = prices.dropna()

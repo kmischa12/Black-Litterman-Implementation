@@ -98,13 +98,12 @@ for current_test_month in all_months:
     
     if train_data.empty or test_data.empty:
         continue
-        
+    
+    # separate features (X) and target (y)
     # Features (X): momentum and volatility
     feature_cols = ['Mom_1M', 'Mom_3M', 'Mom_6M', 'Mom_12M', 'Vol_20D', 'Vol_60D']
-    
     X_train = train_data[feature_cols]
     y_train = train_data['Target_Future_3M_Ret']
-    
     X_test = test_data[feature_cols]
     
     # TRAIN THE MODEL from scratch each time 
@@ -121,6 +120,80 @@ for current_test_month in all_months:
     })
     
     all_predictions.append(month_results)
+
+    # PHASE 4- TRANSLATING THE FORECASTS TO BLACK-LITTERMAN VIEWS 
+    # 1. Calculate the Covariance Matrix (Risk) based  on the past
+    historical_returns = train_data.pivot(columns='Ticker', values='Target_Future_3M_Ret').dropna()
+    cov_matrix = historical_returns.cov().values # Raw numpy array
+    tickers_list = test_data['Ticker'].values
+    num_assets = len(tickers_list)
+
+    # Confidence estimation: calculate Information Coefficient 
+    # get dates for last 36 months of training data 
+    last_36_months_dates = train_data.index.unique()[-36:]
+    recent_train_data = train_data[train_data.index.isin(last_36_months_dates)]
+
+    # Ask the model to predict the last 36 months
+    recent_X = recent_train_data[feature_cols]
+    recent_y_actual = recent_train_data['Target_Future_3M_Ret']
+    recent_preds = ml_model.predict(recent_X)
+
+    # Calculate IC (Pearson Correlation between predictions and actuals)
+    # np.corrcoef returns a matrix, we just want the single correlation value [0, 1]
+    ic_matrix = np.corrcoef(recent_preds, recent_y_actual)
+    ic = ic_matrix[0, 1] 
+    
+    # Handle math edge cases (if correlation fails)
+    if np.isnan(ic): 
+        ic = 0.0
+
+    # Map IC to Confidence Percentage 
+    if ic <= 0.00:
+        c = 0.10
+    elif ic <= 0.05:
+        c = 0.30
+    elif ic <= 0.10:
+        c = 0.50
+    elif ic <= 0.15:
+        c = 0.70
+    else: # 0.20+
+        c = 0.90
+
+    # CONSTRUCT VIEWS (MATRIX P AND VECTOR Q)
+    # Sort the ML predictions to find what the AI thinks is Best and Worst
+    sorted_preds = month_results.sort_values(by='ML_Forecast_Return', ascending=False)
+    
+    num_views = 3 # 3 relative views (Top 3 vs Bottom 3)
+    P_matrix = np.zeros((num_views, num_assets))
+    Q_vector = np.zeros(num_views)
+    
+    for i in range(num_views):
+        long_ticker = sorted_preds.iloc[i]['Ticker']          # AI's Favorite
+        short_ticker = sorted_preds.iloc[-(i+1)]['Ticker']    # AI's Least Favorite
+        
+        # Find exactly where these tickers live in our columns
+        long_idx = np.where(tickers_list == long_ticker)[0][0]
+        short_idx = np.where(tickers_list == short_ticker)[0][0]
+        
+        # Build the [1, -1] View in Matrix P
+        P_matrix[i, long_idx] = 1.0  # +1 for the winner
+        P_matrix[i, short_idx] = -1.0 # -1 for the loser
+        
+        # Build Vector Q (The predicted outperformance spread)
+        pred_long = sorted_preds.iloc[i]['ML_Forecast_Return']
+        pred_short = sorted_preds.iloc[-(i+1)]['ML_Forecast_Return']
+        Q_vector[i] = pred_long - pred_short
+
+        # CALCULATE THE OMEGA MATRIX (Ω)
+        # Omega = (P * Cov * P_T) * ((1 - c) / c)
+        # If c is high (90%), the multiplier becomes (0.1 / 0.9) = 0.11 (Very low doubt)
+        # If c is low (10%), the multiplier becomes (0.9 / 0.1) = 9.0 (High doubt)
+    
+        P_Sigma_P_T = np.dot(np.dot(P_matrix, cov_matrix), P_matrix.T)
+    
+        # add a tiny bit of noise (1e-6) to the diagonal to avoid division by zero
+        # if the model predicts two assets exactly the same
+        Omega_matrix = P_Sigma_P_T * ((1.0 - c) / c) + (np.eye(num_views) * 1e-6)
 
 # compile all the monthly prediction tables together
 final_forecasts = pd.concat(all_predictions).set_index(['Date', 'Ticker'])
