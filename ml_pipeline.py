@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import ElasticNet
+from scipy.optimize import minimize
 import warnings
 warnings.filterwarnings('ignore') # Suppress minor math warnings during the loop
 
@@ -46,6 +47,9 @@ for ticker in monthly_prices.columns:
     # but .shift(-3) mathematically pulls that future answer back in time to align with today
     df['Target_Future_3M_Ret'] = monthly_prices[ticker].pct_change(3).shift(-3)
     
+    # The actual real-world return of the asset over the next 1 month
+    df['Actual_Next_1M_Ret'] = monthly_prices[ticker].pct_change(1).shift(-1)
+    
     all_assets_data.append(df)
 
 # Smash all 14 temporary dataframes together into one dataset
@@ -60,8 +64,6 @@ ml_data = ml_data.sort_index()
 
 print("\n--- PHASE 1 COMPLETE ---")
 print(f"Dataset shape: {ml_data.shape[0]} rows ready for Machine Learning.")
-print("\nHere is a sneak peek at your new ML-ready data:")
-print(ml_data.head())
 
 
 print("\n--- STARTING PHASE 2 & 3: THE EXPANDING WINDOW LOOP ---")
@@ -74,6 +76,7 @@ test_start_date = pd.to_datetime("2015-01-31")
 
 # store all monthly predictions here
 all_predictions = []
+all_portfolio_weights = []
 
 # Initialize the Machine Learning model
 # alpha and l1_ratio are standard "tuning knobs" for Elastic Net
@@ -184,21 +187,103 @@ for current_test_month in all_months:
         pred_short = sorted_preds.iloc[-(i+1)]['ML_Forecast_Return']
         Q_vector[i] = pred_long - pred_short
 
-        # CALCULATE THE OMEGA MATRIX (Ω)
-        # Omega = (P * Cov * P_T) * ((1 - c) / c)
-        # If c is high (90%), the multiplier becomes (0.1 / 0.9) = 0.11 (Very low doubt)
-        # If c is low (10%), the multiplier becomes (0.9 / 0.1) = 9.0 (High doubt)
+    # CALCULATE THE OMEGA MATRIX (Ω)
+    # Omega = (P * Cov * P_T) * ((1 - c) / c)
+    # If c is high (90%), the multiplier becomes (0.1 / 0.9) = 0.11 (Very low doubt)
+    # If c is low (10%), the multiplier becomes (0.9 / 0.1) = 9.0 (High doubt)
     
-        P_Sigma_P_T = np.dot(np.dot(P_matrix, cov_matrix), P_matrix.T)
+    P_Sigma_P_T = np.dot(np.dot(P_matrix, cov_matrix), P_matrix.T)
     
-        # add a tiny bit of noise (1e-6) to the diagonal to avoid division by zero
-        # if the model predicts two assets exactly the same
-        Omega_matrix = P_Sigma_P_T * ((1.0 - c) / c) + (np.eye(num_views) * 1e-6)
+    # add a tiny bit of noise (1e-6) to the diagonal to avoid division by zero
+    # if the model predicts two assets exactly the same
+    Omega_matrix = P_Sigma_P_T * ((1.0 - c) / c) + (np.eye(num_views) * 1e-6)
 
-# compile all the monthly prediction tables together
-final_forecasts = pd.concat(all_predictions).set_index(['Date', 'Ticker'])
+    # PHASE 5: RUN THE OPTIMIZER FOR ASSET ALLOCATION 
+    # 1. Market Baseline 
+    w_mkt = np.ones(num_assets) / num_assets # initializes array with each stock weighted equally
+    risk_aversion = 2.0
+    tau = 0.05
+    Pi = risk_aversion * np.dot(cov_matrix, w_mkt) #baseline of returns 
 
-print("\n--- PHASE 2 & 3 COMPLETE ---")
-print("The model has successfully recorded its predictions.")
-print("\nHere is what it predicted for the very first test month (Jan 2015):")
-print(final_forecasts.loc["2015-01-31"])
+    # 2. Black-Litterman Posterior Math
+    tau_cov_inv = np.linalg.inv(tau * cov_matrix) #precision of market 
+    Omega_inv = np.linalg.inv(Omega_matrix) # precision of AI's views 
+    
+    M_inverse = tau_cov_inv + np.dot(np.dot(P_matrix.T, Omega_inv), P_matrix) #adds market's precision to AI's precision
+    # P_matrix.T translates it to 12 individual stocks 
+    posterior_cov = np.linalg.inv(M_inverse) # updated risk matrix 
+    
+    term1 = np.dot(tau_cov_inv, Pi) # pull of baseline: market's baseline returns times the volatility/ precision
+    term2 = np.dot(np.dot(P_matrix.T, Omega_inv), Q_vector) # pull of AI: AI's views' returns times the precision
+    posterior_returns = np.dot(posterior_cov, (term1 + term2)) #combined pull (term 1 + term 2) / total precision
+
+    #3. constrained optimization (scipy)
+    def objective_function(weights):
+        port_return = np.dot(weights, posterior_returns)
+        port_variance = np.dot(weights.T, np.dot(posterior_cov, weights))
+        utility = port_return - (risk_aversion / 2) * port_variance # score is our return - risk 
+        return -utility
+    
+    # CONSTRAINTS: Fully Invested (sum to 100%) & Max 45% per asset
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0}) # sum - 1 must be zero (fully invest)
+    bounds = tuple((0.0, 0.45) for _ in range(num_assets))
+
+
+    # Run the Optimizer
+    opt_result = minimize(objective_function, w_mkt, method='SLSQP', bounds=bounds, constraints=constraints)
+    
+    # Store the final Portfolio Weights for this month
+    weight_results = pd.DataFrame({
+        'Date': current_test_month,
+        'Ticker': tickers_list,
+        'Optimal_Weight': opt_result.x,
+        'Equal_Weight': w_mkt,
+        'Actual_Return': test_data['Actual_Next_1M_Ret'].values
+    })
+    all_portfolio_weights.append(weight_results)
+
+# END OF LOOP
+
+print("\n--- PHASE 5 COMPLETE ---")
+
+#PHASE 6: PERFORMANCE METRICS 
+print("Simulating Portfolio Returns and generating Report Card...")
+df_performance = pd.concat(all_portfolio_weights)
+
+# 1. Calculate Realized Monthly Return for the Strategy vs. Baseline
+# Formula: Weight assigned * Actual Next Month Return
+df_performance['ML_Cont'] = df_performance['Optimal_Weight'] * df_performance['Actual_Return']
+df_performance['EQ_Cont'] = df_performance['Equal_Weight'] * df_performance['Actual_Return']
+
+
+# 2. Group by Date to get the total portfolio return for each specific month
+monthly_perf = df_performance.groupby('Date')[['ML_Cont', 'EQ_Cont']].sum() # performance of whole portfolio for this month
+
+# 3. Calculate Cumulative Wealth (If $1.00 was invested at the start)
+cumulative_returns = (1 + monthly_perf).cumprod()
+
+# 4. Calculate Total Months for Annualization Math
+total_months = len(monthly_perf)
+
+# 5. Calculate Annualized Return (Compound Annual Growth Rate)
+annualized_return_ml = (cumulative_returns['ML_Cont'].iloc[-1]) ** (12 / total_months) - 1
+annualized_return_eq = (cumulative_returns['EQ_Cont'].iloc[-1]) ** (12 / total_months) - 1
+
+# 6. Calculate Annualized Volatility (Risk)- multiply standard deviation with square root of time 
+annual_vol_ml = monthly_perf['ML_Cont'].std() * np.sqrt(12) 
+annual_vol_eq = monthly_perf['EQ_Cont'].std() * np.sqrt(12)
+
+# 7. Calculate Sharpe Ratio (Return divided by Risk)
+sharpe_ml = annualized_return_ml / annual_vol_ml
+sharpe_eq = annualized_return_eq / annual_vol_eq
+
+print("\n=========================================================")
+print("      10-YEAR BACKTEST REPORT (2015 - PRESENT)           ")
+print("=========================================================")
+print(f"Total Months Tested: {total_months}")
+print("---------------------------------------------------------")
+print("PORTFOLIO             | ANN. RETURN | ANN. RISK | SHARPE ")
+print("---------------------------------------------------------")
+print(f"Machine Learning (BL) |    {annualized_return_ml*100:>5.2f}%   |   {annual_vol_ml*100:>5.2f}%  |  {sharpe_ml:>5.2f} ")
+print(f"Equal-Weight Baseline |    {annualized_return_eq*100:>5.2f}%   |   {annual_vol_eq*100:>5.2f}%  |  {sharpe_eq:>5.2f} ")
+print("=========================================================\n")
