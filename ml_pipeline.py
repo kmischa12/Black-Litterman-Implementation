@@ -287,3 +287,24 @@ print("---------------------------------------------------------")
 print(f"Machine Learning (BL) |    {annualized_return_ml*100:>5.2f}%   |   {annual_vol_ml*100:>5.2f}%  |  {sharpe_ml:>5.2f} ")
 print(f"Equal-Weight Baseline |    {annualized_return_eq*100:>5.2f}%   |   {annual_vol_eq*100:>5.2f}%  |  {sharpe_eq:>5.2f} ")
 print("=========================================================\n")
+
+
+
+# YEAR-BY-YEAR BREAKDOWN 
+print("=========================================================")
+print("                 YEAR-BY-YEAR BREAKDOWN                  ")
+print("=========================================================")
+print("YEAR | ML STRATEGY | EQUAL-WEIGHT | OUTPERFORMED? ")
+print("---------------------------------------------------------")
+
+# Resample monthly returns to yearly returns
+yearly_perf = (1 + monthly_perf).resample('YE').prod() - 1
+
+# Print each year out
+for year_date, row in yearly_perf.iterrows():
+    ml_ret = row['ML_Cont'] * 100
+    eq_ret = row['EQ_Cont'] * 100
+    beat = "YES" if ml_ret > eq_ret else "NO"
+    print(f"{year_date.year} | {ml_ret:>8.2f}%   | {eq_ret:>10.2f}% | {beat}")
+    
+print("=========================================================\n")
