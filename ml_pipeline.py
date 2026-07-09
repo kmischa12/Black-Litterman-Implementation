@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import ElasticNet
+import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 import warnings
 warnings.filterwarnings('ignore') # Suppress minor math warnings during the loop
@@ -246,6 +247,13 @@ for current_test_month in all_months:
 
 print("\n--- PHASE 5 COMPLETE ---")
 
+
+# --- SAVE PREDICTIONS ---
+df_all_preds = pd.concat(all_predictions)
+df_all_preds.to_csv("ml_predictions.csv", index=False)
+print("Machine learning predictions saved to ml_predictions.csv")
+
+
 #PHASE 6: PERFORMANCE METRICS 
 print("Simulating Portfolio Returns and generating Report Card...")
 df_performance = pd.concat(all_portfolio_weights)
@@ -308,3 +316,46 @@ for year_date, row in yearly_perf.iterrows():
     print(f"{year_date.year} | {ml_ret:>8.2f}%   | {eq_ret:>10.2f}% | {beat}")
     
 print("=========================================================\n")
+
+
+# VISUALIZING RESULTS
+
+
+# 1. Cumulative Performance Chart
+plt.figure(figsize=(12, 6))
+# Using cumulative returns calculated earlier
+plt.plot(cumulative_returns.index, cumulative_returns['ML_Cont'], label='Machine Learning (BL)', linewidth=2.5, color='#1f77b4')
+plt.plot(cumulative_returns.index, cumulative_returns['EQ_Cont'], label='Equal-Weight Baseline', linewidth=2, linestyle='--', color='#7f7f7f')
+plt.title('Cumulative Portfolio Wealth: ML-BL vs. Baseline (2015-2026)')
+plt.ylabel('Cumulative Wealth ($)')
+plt.xlabel('Date')
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.tight_layout()
+plt.show()
+
+# 2. Monthly Excess Return Chart - Highlighting when the model beat the market 
+monthly_perf['Excess'] = monthly_perf['ML_Cont'] - monthly_perf['EQ_Cont']
+
+plt.figure(figsize=(12, 6))
+# Green for outperformance, Red for underperformance
+colors = ['#44c265' if x >= 0 else '#fe8983' for x in monthly_perf['Excess']]
+plt.bar(monthly_perf.index, monthly_perf['Excess'], color=colors, width=15, alpha=0.7)
+plt.axhline(0, color='black', linewidth=0.8)
+plt.title('Monthly Active Alpha: ML Strategy vs. Baseline')
+plt.ylabel('Excess Monthly Return (%)')
+plt.xlabel('Date')
+plt.grid(True, linestyle='--', alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# 3. Stacked Bar Chart of Asset Allocation Composition
+yearly_weights = df_performance.groupby([df_performance['Date'].dt.year, 'Ticker'])['Optimal_Weight'].mean().unstack()
+
+yearly_weights.plot(kind='bar', stacked=True, figsize=(14, 7), colormap='tab20', edgecolor='white')
+plt.title('Dynamic Asset Allocation Composition (Yearly Average Weights)')
+plt.ylabel('Allocation Weight (%)')
+plt.xlabel('Year')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()
